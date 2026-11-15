@@ -168,7 +168,11 @@ def _binding(runner, source, profile):
         if homes.get(owner_name) != home:
             raise RuntimeStoreError('profile_mismatch')
         runtime_profile = _runtime_profile(runner, source, profile, owner_name, homes, relay)
-        if (source.profile or primary) != runtime_profile or runtime_profile not in homes:
+        # An unstamped source is routed purely by its route; its effective profile is the route
+        # target, not the launch primary, so a route to a served non-primary profile is admitted.
+        # A *stamped* source must still agree with the route target (never silently re-routed).
+        if (source.profile is not None and source.profile != runtime_profile) \
+                or runtime_profile not in homes:
             raise RuntimeStoreError('profile_mismatch')
         runtime_home = homes[runtime_profile]
         # Revoking ONE served profile (its directory removed) fails that profile only.
