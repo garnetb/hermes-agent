@@ -43,7 +43,9 @@ if _SCRIPTS_DIR not in sys.path:
 from _hermes_home import display_hermes_home, get_hermes_home
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
+# GWS_TOKEN_PATH env override: bootstrap a second account's token (e.g.
+# ~/.hermes/google_token_garret.json) without touching the main token file.
+TOKEN_PATH = Path(os.environ.get("GWS_TOKEN_PATH") or HERMES_HOME / "google_token.json")
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 PENDING_AUTH_PATH = HERMES_HOME / "google_oauth_pending.json"
 
@@ -76,6 +78,29 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _load_credentials(scopes: list | None = None):
+    """Load TOKEN_PATH into Credentials, normalizing `expiry` in memory.
+
+    The token file's `expiry` may be a float Unix epoch or a numeric string
+    (written by the gws CLI), but google-auth only accepts an ISO-8601
+    string and crashes on other forms. Normalize in memory; the file itself
+    is never rewritten by this load.
+    """
+    from datetime import UTC, datetime
+
+    from google.oauth2.credentials import Credentials
+
+    with open(TOKEN_PATH, encoding="utf-8") as f:
+        info = json.load(f)
+    exp = info.get("expiry")
+    if isinstance(exp, bool) or exp in (None, ""):
+        info.pop("expiry", None)  # absent -> google-auth treats as expired -> refresh
+    elif isinstance(exp, (int, float)) or (isinstance(exp, str) and exp.strip().isdigit()):
+        info["expiry"] = datetime.fromtimestamp(float(exp), tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    # else: ISO-8601 string — google-auth accepts as-is
+    return Credentials.from_authorized_user_info(info, scopes=scopes)
 
 
 def _missing_scopes_from_payload(payload: dict) -> list[str]:
@@ -129,8 +154,7 @@ def check_auth_live():
         return False
     try:
         from googleapiclient.discovery import build
-        from google.oauth2.credentials import Credentials
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        creds = _load_credentials()
         service = build("calendar", "v3", credentials=creds)
         service.calendarList().list(maxResults=1).execute()
         print("LIVE_CHECK_OK: Real API call succeeded.")
@@ -162,7 +186,7 @@ def check_auth(quiet: bool = False):
         # Passing scopes forces google-auth to validate them on refresh,
         # which fails with invalid_scope if the token has fewer scopes
         # than requested.
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        creds = _load_credentials()
     except Exception as e:
         print(f"TOKEN_CORRUPT: {e}")
         return False
@@ -392,7 +416,7 @@ def revoke():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = _load_credentials(SCOPES)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
 

@@ -39,7 +39,9 @@ if _SCRIPTS_DIR not in sys.path:
 from _hermes_home import get_hermes_home
 
 HERMES_HOME = get_hermes_home()
-TOKEN_PATH = HERMES_HOME / "google_token.json"
+# GOOGLE_TOKEN_PATH env override: point the gws helper at a per-account token
+# (e.g. ~/.hermes/google_token_garret.json). Defaults to the main token.
+TOKEN_PATH = Path(os.environ.get("GOOGLE_TOKEN_PATH") or HERMES_HOME / "google_token.json")
 CLIENT_SECRET_PATH = HERMES_HOME / "google_client_secret.json"
 
 SCOPES = [
@@ -79,6 +81,29 @@ def _stored_token_scopes() -> list[str]:
     return list(SCOPES)
 
 
+def _load_credentials(scopes: list[str] | None = None):
+    """Load the token file into Credentials, normalizing `expiry` in memory.
+
+    The token file's `expiry` may be a float Unix epoch or a numeric string
+    (written by the gws CLI), but google-auth only accepts an ISO-8601
+    string and crashes on other forms. Normalize in memory; the file itself
+    is never rewritten by this load.
+    """
+    from datetime import UTC, datetime
+
+    from google.oauth2.credentials import Credentials
+
+    with open(TOKEN_PATH, encoding="utf-8") as f:
+        info = json.load(f)
+    exp = info.get("expiry")
+    if isinstance(exp, bool) or exp in (None, ""):
+        info.pop("expiry", None)  # absent -> google-auth treats as expired -> refresh
+    elif isinstance(exp, (int, float)) or (isinstance(exp, str) and exp.strip().isdigit()):
+        info["expiry"] = datetime.fromtimestamp(float(exp), tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    # else: ISO-8601 string — google-auth accepts as-is
+    return Credentials.from_authorized_user_info(info, scopes=scopes)
+
+
 def _gws_binary() -> str | None:
     override = os.getenv("HERMES_GWS_BIN")
     if override:
@@ -89,6 +114,19 @@ def _gws_binary() -> str | None:
 def _gws_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"] = str(TOKEN_PATH)
+    # Per-account token (GOOGLE_TOKEN_PATH set): isolate the gws token cache.
+    # The default-location cache is keyed on the shared OAuth client, so with
+    # a second account's credentials file it would silently serve the main
+    # account's cached token (verified: whoami returned the main account).
+    # A per-account config dir + file keyring backend keeps each account's
+    # cache separate and stable across runs. No env var = default account =
+    # exactly today's behavior (no config-dir override).
+    override = os.environ.get("GOOGLE_TOKEN_PATH")
+    if override:
+        base = Path(override).name
+        acct = base[len("google_token_"):-len(".json")] if base.startswith("google_token_") and base.endswith(".json") else base
+        env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = str(Path.home() / ".config" / f"gws-{acct}")
+        env["GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"] = "file"
     return env
 
 
@@ -247,10 +285,9 @@ def get_credentials():
     """Load and refresh credentials from token file."""
     _ensure_authenticated()
 
-    from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
 
-    creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
+    creds = _load_credentials(_stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         TOKEN_PATH.write_text(
